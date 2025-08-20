@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 const DiscoveryPanel = dynamic(() => import('./components/DiscoveryPanel'), { ssr: false })
 const SelectAndScrapePanel = dynamic(() => import('./components/SelectAndScrapePanel'), { ssr: false })
@@ -33,6 +33,8 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<ApiResponse | null>(null)
   const [plannedTargets, setPlannedTargets] = useState<number | null>(null)
+  const [parsedList, setParsedList] = useState<any[]>([])
+  const selectPanelRef = useRef<any>(null)
 
   async function handleScrape(e: React.FormEvent) {
     e.preventDefault()
@@ -88,50 +90,49 @@ export default function Home() {
           <p className="text-xs text-gray-600 mt-2">Discovery uses sitemap.xml when available; otherwise falls back to heuristic pages.</p>
         </section>
 
-        <DiscoveryPanel sharedBaseUrl={urlsInput} />
-        <SelectAndScrapePanel sharedBaseUrl={urlsInput} />
+        <DiscoveryPanel
+          sharedBaseUrl={urlsInput}
+          onRunAllRequest={(baseUrl: string) => {
+            if (selectPanelRef.current?.runAll) {
+              selectPanelRef.current.runAll(baseUrl)
+            }
+          }}
+        />
+        <SelectAndScrapePanel
+          ref={selectPanelRef}
+          sharedBaseUrl={urlsInput}
+          autoRunOnMount={true}
+          onParsed={({ baseUrl, clinic_info, model, elapsed_ms }) => {
+            setParsedList(prev => [...prev, { baseUrl, clinic_info, model, elapsed_ms, ts: Date.now() }])
+          }}
+        />
 
         
 
         <div className="grid grid-cols-1 gap-6">
           <section className="space-y-4">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-medium">Pages</h2>
-              {data && (
-                <span className="text-xs text-gray-600">{data.input_count} URL{data.input_count === 1 ? '' : 's'}</span>
+              <h2 className="text-lg font-medium">Parsed Runs</h2>
+              {parsedList.length > 0 && (
+                <span className="text-xs text-gray-600">{parsedList.length} run{parsedList.length === 1 ? '' : 's'}</span>
               )}
             </div>
 
-            {!data && (
-              <div className="bg-white border border-dashed border-gray-300 rounded-xl p-6 text-sm text-gray-600">No results yet. Enter URLs above and click Scrape.</div>
+            {parsedList.length === 0 && (
+              <div className="bg-white border border-dashed border-gray-300 rounded-xl p-6 text-sm text-gray-600">No parsed runs yet. Enter a URL, or it will auto-run on load if present.</div>
             )}
 
-            {data && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {data.results.map((r, idx) => {
-                  const statusColor = r.ok ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-                  if (typeof window !== 'undefined') {
-                    console.log('[scrape:card]', { url: r.url, status: r.status_code, ok: r.ok, ms: r.elapsed_ms, len: r.length })
-                  }
-                  return (
-                    <div key={idx} className="bg-white border border-gray-200 rounded-xl shadow-sm p-4">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className={`text-xs font-medium px-2 py-1 rounded-full ${statusColor}`}>{r.ok ? 'OK' : 'Error'}</span>
-                        <a className="text-xs text-purple-700 hover:text-purple-800 underline" href={r.reader_url} target="_blank" rel="noreferrer">Open in Jina</a>
-                      </div>
-                      <div className="text-sm font-medium break-words mb-1">{r.url}</div>
-                      <div className="text-xs text-gray-600">Base: {r.base_url || '—'}</div>
-                      <div className="text-xs text-gray-600">Path: {r.path || '/'}</div>
-                      <div className="text-xs text-gray-600 mb-3">Status: {String(r.status_code)} · Length: {r.length} · Keywords: {String(r.contains_keywords)}</div>
-                      {r.error && (
-                        <div className="text-xs text-red-700 mb-2">{r.error}</div>
-                      )}
-                      {r.text && (
-                        <pre className="text-xs whitespace-pre-wrap leading-relaxed max-h-64 overflow-auto border border-gray-100 rounded-lg p-2 bg-gray-50">{r.text}</pre>
-                      )}
+            {parsedList.length > 0 && (
+              <div className="grid grid-cols-1 gap-3">
+                {parsedList.map((p, idx) => (
+                  <div key={idx} className="bg-white border border-gray-200 rounded-xl shadow-sm p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-sm font-medium break-all">{p.baseUrl || '—'}</div>
+                      <div className="text-xs text-gray-600">{p.model || '—'} · {typeof p.elapsed_ms === 'number' ? `${p.elapsed_ms} ms` : '—'}</div>
                     </div>
-                  )
-                })}
+                    <pre className="text-xs whitespace-pre-wrap leading-relaxed border border-gray-100 rounded-lg p-2 bg-gray-50">{JSON.stringify(p.clinic_info, null, 2)}</pre>
+                  </div>
+                ))}
               </div>
             )}
           </section>

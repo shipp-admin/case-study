@@ -46,7 +46,10 @@ def gemini_select_relevant_urls(urls: List[str], max_urls: int = 10) -> List[str
         )
         examples_hint = [
             "/about", "/our-team", "/team", "/providers", "/services", "/specialties", "/therapy",
-            "/psychological-evaluations", "/locations", "/contact", "/dbt-program", "/emdr-program",
+            "/psychological-evaluations",
+            # Location-oriented pages (strongly prefer at least one of these)
+            "/locations", "/our-locations", "/location", "/contact", "/contact-us", "/find-us", "/directions", "/map",
+            "/dbt-program", "/emdr-program",
         ]
         # Keep input window manageable to avoid model truncation: include full list but sliced to ~10k chars
         import json
@@ -70,7 +73,8 @@ def gemini_select_relevant_urls(urls: List[str], max_urls: int = 10) -> List[str
             "instructions": [
                 "From the provided URLs, select up to N URLs (most relevant first) that best help extract these fields: specialty, modalities, location, clinic_size.",
                 "STRICTLY EXCLUDE: blog, news, media, video, events, posts, categories, tags, cart, privacy, terms, login.",
-                "Prefer pages like About, Team/Providers, Services/Specialties, Therapy, Psychological Evaluations, Locations/Contact, Programs (DBT/EMDR).",
+                "Prefer pages like About, Team/Providers, Services/Specialties, Therapy, Psychological Evaluations, Programs (DBT/EMDR).",
+                "Must include at least one page likely to contain location information if present: pages labelled locations, location, contact, contact-us, find-us, map, or directions.",
                 "Return ONLY a JSON array of strings with URLs; no additional keys or commentary.",
             ],
             "N": max_urls,

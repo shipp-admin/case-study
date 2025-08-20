@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from 'react'
+import { useState, useEffect, forwardRef, useImperativeHandle } from 'react'
 
 type Result = {
   url: string
@@ -33,7 +33,17 @@ type DSLResponse = {
   parse_model?: string | null
 }
 
-export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl: string }) {
+type Props = {
+  sharedBaseUrl: string
+  autoRunOnMount?: boolean
+  onParsed?: (args: { baseUrl: string, clinic_info: { specialty: string, modalities: string, location: string, clinic_size: string }, model?: string | null, elapsed_ms?: number }) => void
+}
+
+export type SelectAndScrapePanelHandle = {
+  runAll: (baseUrl?: string) => Promise<void>
+}
+
+function SelectAndScrapePanelInner({ sharedBaseUrl, autoRunOnMount, onParsed }: Props, ref: React.Ref<SelectAndScrapePanelHandle>) {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<DSLResponse | null>(null)
@@ -75,9 +85,8 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
     }
   }
 
-  async function handleScrapeSelected(e: React.FormEvent) {
-    e.preventDefault()
-    if (!selectedOnly || selectedOnly.length === 0) return
+  async function scrapeAndParse(urls: string[], baseData: DSLResponse | null, effectiveBaseUrl?: string) {
+    if (!urls || urls.length === 0) return
     setIsLoading(true)
     setError(null)
     setStep('scraping')
@@ -85,7 +94,7 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
       const resp = await fetch('/api/scrape-pages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls: selectedOnly, limit_chars: 500 }),
+        body: JSON.stringify({ urls, limit_chars: 500 }),
       })
       if (!resp.ok) {
         let detail = ''
@@ -94,7 +103,7 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
       }
       const json = await resp.json()
       const results = json.results || []
-      let merged: DSLResponse | null = data ? { ...data, results } : null
+      let merged: DSLResponse | null = baseData ? { ...baseData, results } : null
       setData(merged)
       if (typeof window !== 'undefined') console.log('[dsl:scraped]', merged)
 
@@ -103,20 +112,62 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
         .map(r => (r.text || '').trim())
         .filter(Boolean)
         .join('\n\n')
-      if (combinedText.length > 0 || (selectedOnly && selectedOnly.length > 0)) {
+      if (combinedText.length > 0 || (urls && urls.length > 0)) {
         setStep('parsing')
         const parseResp = await fetch('/api/parse', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: combinedText, urls: selectedOnly }),
+          body: JSON.stringify({ text: combinedText, urls }),
         })
         if (parseResp.ok) {
           const parsed = await parseResp.json()
           merged = merged ? { ...merged, clinic_info: parsed?.clinic_info, parse_elapsed_ms: parsed?.elapsed_ms, parse_model: parsed?.model } : merged
           setData(merged)
           if (typeof window !== 'undefined') console.log('[dsl:parsed]', parsed)
+          if (onParsed && merged && merged.clinic_info) {
+            onParsed({ baseUrl: effectiveBaseUrl || baseData?.base_url || '', clinic_info: merged.clinic_info, model: merged.parse_model, elapsed_ms: merged.parse_elapsed_ms })
+          }
         }
       }
+    } finally {
+      setIsLoading(false)
+      setStep('idle')
+    }
+  }
+
+  async function handleScrapeSelected(e: React.FormEvent) {
+    e.preventDefault()
+    if (!selectedOnly || selectedOnly.length === 0) return
+    try { await scrapeAndParse(selectedOnly, data, sharedBaseUrl) } catch (err: any) { setError(err?.message || 'Request failed') }
+  }
+
+  async function runAllCore(overrideBaseUrl?: string) {
+    setIsLoading(true)
+    setError(null)
+    setData(null)
+    setSelectedOnly(null)
+    setStep('selecting')
+    try {
+      const baseUrl = overrideBaseUrl ?? sharedBaseUrl
+      const urlTrimmed = (baseUrl || '').trim()
+      const resp = await fetch('/api/discover-select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: urlTrimmed, max_discover: 100, max_select: 10 }),
+      })
+      if (!resp.ok) {
+        let detail = ''
+        try { detail = await resp.text() } catch {}
+        throw new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`)
+      }
+      const json = (await resp.json()) as DSLResponse
+      setSelectedOnly(json.selected || [])
+      const baseData: DSLResponse = { ...json, results: [], limit_chars: 500 }
+      setData(baseData)
+      if (typeof window !== 'undefined') console.log('[dsl:selected]', json)
+
+      // proceed to scrape and parse
+      await scrapeAndParse(json.selected || [], baseData, baseUrl)
     } catch (err: any) {
       setError(err?.message || 'Request failed')
       if (typeof window !== 'undefined') console.error('[dsl:error]', err)
@@ -125,6 +176,24 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
       setStep('idle')
     }
   }
+
+  async function handleRunAll(e: React.FormEvent) {
+    e.preventDefault()
+    await runAllCore()
+  }
+
+  useImperativeHandle(ref, () => ({
+    runAll: async (baseUrl?: string) => {
+      await runAllCore(baseUrl)
+    },
+  }))
+
+  useEffect(() => {
+    if (autoRunOnMount && (sharedBaseUrl || '').trim()) {
+      runAllCore(sharedBaseUrl).catch(() => {})
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   return (
     <section className="bg-white border border-gray-200 rounded-xl shadow-sm p-5 mb-6">
@@ -149,6 +218,14 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
             disabled={isLoading || !selectedOnly || selectedOnly.length === 0}
           >
             {step === 'scraping' ? 'Scraping…' : step === 'parsing' ? 'Parsing…' : 'Scrape selected'}
+          </button>
+          <button
+            type="button"
+            onClick={handleRunAll}
+            className="inline-flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
+            disabled={isLoading}
+          >
+            {step !== 'idle' ? 'Running…' : 'Run all'}
           </button>
           {error && <span className="text-sm text-red-600">{error}</span>}
         </div>
@@ -219,5 +296,9 @@ export default function SelectAndScrapePanel({ sharedBaseUrl }: { sharedBaseUrl:
     </section>
   )
 }
+
+const SelectAndScrapePanel = forwardRef<SelectAndScrapePanelHandle, Props>(SelectAndScrapePanelInner)
+
+export default SelectAndScrapePanel
 
 
