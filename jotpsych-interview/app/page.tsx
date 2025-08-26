@@ -35,6 +35,9 @@ export default function Home() {
   const [plannedTargets, setPlannedTargets] = useState<number | null>(null)
   const [parsedList, setParsedList] = useState<any[]>([])
   const selectPanelRef = useRef<any>(null)
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
+  const CHAR_LIMIT_PER_PAGE = 13000
+  const MAX_SELECT = 10
 
   async function handleScrape(e: React.FormEvent) {
     e.preventDefault()
@@ -88,6 +91,14 @@ export default function Home() {
             onChange={(e) => setUrlsInput(e.target.value)}
           />
           <p className="text-xs text-gray-600 mt-2">Discovery uses sitemap.xml when available; otherwise falls back to heuristic pages.</p>
+          <div className="mt-2 text-[11px] text-gray-600">
+            <div>Limits overview:</div>
+            <ul className="list-disc ml-5">
+              <li>Discover: up to 20 URLs listed</li>
+              <li>Select: up to {MAX_SELECT} URLs sent to scraping</li>
+              <li>Scrape: up to {CHAR_LIMIT_PER_PAGE} characters per page</li>
+            </ul>
+          </div>
         </section>
 
         <DiscoveryPanel
@@ -101,9 +112,13 @@ export default function Home() {
         <SelectAndScrapePanel
           ref={selectPanelRef}
           sharedBaseUrl={urlsInput}
-          autoRunOnMount={true}
+          autoRunOnMount={false}
           onParsed={({ baseUrl, clinic_info, model, elapsed_ms }) => {
-            setParsedList(prev => [...prev, { baseUrl, clinic_info, model, elapsed_ms, ts: Date.now() }])
+            setParsedList(prev => {
+              const last = prev[prev.length - 1]
+              const isDuplicate = last && last.baseUrl === baseUrl && JSON.stringify(last.clinic_info) === JSON.stringify(clinic_info)
+              return isDuplicate ? prev : [...prev, { baseUrl, clinic_info, model, elapsed_ms, ts: Date.now() }]
+            })
           }}
         />
 
@@ -128,7 +143,24 @@ export default function Home() {
                   <div key={idx} className="bg-white border border-gray-200 rounded-xl shadow-sm p-4">
                     <div className="flex items-center justify-between mb-2">
                       <div className="text-sm font-medium break-all">{p.baseUrl || '—'}</div>
-                      <div className="text-xs text-gray-600">{p.model || '—'} · {typeof p.elapsed_ms === 'number' ? `${p.elapsed_ms} ms` : '—'}</div>
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            try {
+                              const json = JSON.stringify(p.clinic_info || {}, null, 2)
+                              navigator.clipboard.writeText(json).then(() => {
+                                setCopiedIdx(idx)
+                                setTimeout(() => setCopiedIdx(prev => (prev === idx ? null : prev)), 1200)
+                              }).catch(() => {})
+                            } catch {}
+                          }}
+                          className="text-xs bg-gray-800 hover:bg-gray-900 text-white px-2 py-1 rounded"
+                        >
+                          {copiedIdx === idx ? 'Copied' : 'Copy JSON'}
+                        </button>
+                        <div className="text-xs text-gray-600">{p.model || '—'} · {typeof p.elapsed_ms === 'number' ? `${p.elapsed_ms} ms` : '—'}</div>
+                      </div>
                     </div>
                     <pre className="text-xs whitespace-pre-wrap leading-relaxed border border-gray-100 rounded-lg p-2 bg-gray-50">{JSON.stringify(p.clinic_info, null, 2)}</pre>
                   </div>

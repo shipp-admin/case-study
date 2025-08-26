@@ -22,7 +22,93 @@ def _get_env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
-def gemini_select_relevant_urls(urls: List[str], max_urls: int = 10) -> List[str]:
+def _mark_empty_fields_as_error(clinic_info: Dict[str, Any]) -> Dict[str, str]:
+    """Ensure empty/unknown fields are explicitly marked as 'Error'."""
+    fields = ["clinic_name", "specialty", "modalities", "location", "clinic_size"]
+    normalized: Dict[str, str] = {}
+    for key in fields:
+        value = clinic_info.get(key, "") if isinstance(clinic_info, dict) else ""
+        text = str(value).strip() if value is not None else ""
+        normalized[key] = text if text else "Error"
+    return normalized
+
+
+def _extract_location_snippet(text: str, context_window: int = 400) -> str:
+    """Return a small snippet surrounding likely address/location text.
+    This helps capture bottom-of-page addresses without inflating total tokens.
+    """
+    if not text:
+        return ""
+    import re as _re
+    candidates = [
+        r"\bMailing Address\b[\s\S]{0,200}?\b\d+\s+[^,\n]+,\s*[A-Z][a-zA-Z]+,\s*[A-Z]{2}\b",  # 'Mailing Address' then street, City, ST
+        r"\b\d+\s+[^,\n]+,\s*[A-Z][a-zA-Z]+,\s*[A-Z]{2}\s*\d{5}\b",  # '123 St, City, ST 12345'
+        r"\b[A-Z][a-zA-Z]+,\s*[A-Z]{2}\s*\d{5}\b",  # 'Raleigh, NC 27609'
+        r"\b[A-Z][a-zA-Z]+,\s*(Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New\s+Hampshire|New\s+Jersey|New\s+Mexico|New\s+York|North\s+Carolina|North\s+Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode\s+Island|South\s+Carolina|South\s+Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West\s+Virginia|Wisconsin|Wyoming)\b",
+    ]
+    for pat in candidates:
+        m = _re.search(pat, text)
+        if not m:
+            continue
+        start = max(0, m.start() - context_window // 2)
+        end = min(len(text), m.end() + context_window // 2)
+        return text[start:end]
+    return ""
+
+
+def _extract_location_candidates(text: str, max_items: int = 8) -> List[str]:
+    """Extract candidate location strings (e.g., 'Raleigh, NC') and return the most frequent first.
+    Includes variants like 'City, ST' and 'City, StateName' and 'City, ST 12345'.
+    """
+    if not text:
+        return []
+    import re as _re
+    patterns = [
+        r"\b([A-Z][a-zA-Z]+,\s*[A-Z]{2})\b",
+        r"\b([A-Z][a-zA-Z]+,\s*[A-Z]{2}\s*\d{5})\b",
+        r"\b([A-Z][a-zA-Z]+,\s*(Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New\s+Hampshire|New\s+Jersey|New\s+Mexico|New\s+York|North\s+Carolina|North\s+Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode\s+Island|South\s+Carolina|South\s+Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West\s+Virginia|Wisconsin|Wyoming))\b",
+    ]
+    hits: Dict[str, int] = {}
+    for pat in patterns:
+        for m in _re.finditer(pat, text):
+            g = m.group(1).strip()
+            hits[g] = hits.get(g, 0) + 1
+    if not hits:
+        return []
+    ordered = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [k for k, _ in ordered[:max_items]]
+
+
+def _is_media_url(u: str) -> bool:
+    if not u:
+        return False
+    
+    # Clean the URL by removing potential markdown artifacts and query parameters
+    lu = (u or "").lower()
+    # Remove query parameters and fragments
+    lu = re.sub(r'[?#].*$', '', lu)
+    # Remove potential markdown artifacts
+    lu = re.sub(r'\)\]\([^)]*\)$', '', lu)
+    lu = re.sub(r'\)$', '', lu)
+    
+    media_exts = [
+        # Images
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp", ".tiff", ".tif",
+        # Documents
+        ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".rtf",
+        # Media files
+        ".mp4", ".mov", ".avi", ".wmv", ".flv", ".mp3", ".wav", ".ogg", ".m4a",
+        # Archives
+        ".zip", ".rar", ".tar", ".gz", ".7z",
+        # Other file types irrelevant for content analysis
+        ".css", ".js", ".xml", ".json", ".csv",
+    ]
+    
+    # Check if URL ends with any media extension
+    return any(lu.endswith(ext) for ext in media_exts)
+
+
+def gemini_select_relevant_urls(urls: List[str], max_urls: int = 5) -> List[str]:
     """Use Gemini to pick the most relevant clinic pages for extracting
     specialty, modalities, location, clinic_size.
     Returns up to max_urls URLs from the provided list.
@@ -73,7 +159,7 @@ def gemini_select_relevant_urls(urls: List[str], max_urls: int = 10) -> List[str
             "instructions": [
                 "From the provided URLs, select up to N URLs (most relevant first) that best help extract these fields: specialty, modalities, location, clinic_size.",
                 "STRICTLY EXCLUDE: blog, news, media, video, events, posts, categories, tags, cart, privacy, terms, login.",
-                "Prefer pages like About, Team/Providers, Services/Specialties, Therapy, Psychological Evaluations, Programs (DBT/EMDR).",
+                "Prefer a diverse set covering: (1) About/Who we are, (2) Team/Providers, (3) Services/Specialties or Therapy, (4) Locations/Contact/Directions, (5) Any page strongly describing programs (DBT/EMDR).",
                 "Must include at least one page likely to contain location information if present: pages labelled locations, location, contact, contact-us, find-us, map, or directions.",
                 "Return ONLY a JSON array of strings with URLs; no additional keys or commentary.",
             ],
@@ -115,14 +201,52 @@ def gemini_select_relevant_urls(urls: List[str], max_urls: int = 10) -> List[str
         exclude_substrings = [
             "/blog", "/news", "/media", "/video", "/events", "/post", "/posts", "/category", "/tag",
             "/cart", "/privacy", "/terms", "/login", "/wp-", "/feed", "/authors",
+            "/sitemap", "/robots.txt",
         ]
-        filtered = [u for u in selected if not any(x in u.lower() for x in exclude_substrings)]
+        # Additional exclusions for exact matches and endings
+        exclude_exact_or_endings = [
+            "sitemap.xml", "sitemap_index.xml", "robots.txt", ".xml", ".rss", ".atom"
+        ]
+        
+        def should_exclude(url: str) -> bool:
+            url_lower = url.lower()
+            # Check substring exclusions
+            if any(x in url_lower for x in exclude_substrings):
+                return True
+            # Check exact matches or endings
+            if any(url_lower.endswith(x) or url_lower.split('/')[-1] == x for x in exclude_exact_or_endings):
+                return True
+            # Check media URLs
+            if _is_media_url(url):
+                return True
+            return False
+        
+        filtered = [u for u in selected if not should_exclude(u)]
         if filtered:
+            # Ensure at least one likely-location page is present
+            lowered_sel = [u.lower() for u in filtered]
+            have_location = any(any(k in u for k in ["/locations", "/location", "/contact", "/contact-us", "/find-us", "/directions", "/map"]) for u in lowered_sel)
+            if not have_location:
+                for cand in urls:
+                    lc = cand.lower()
+                    if any(k in lc for k in ["/locations", "/location", "/contact", "/contact-us", "/find-us", "/directions", "/map"]):
+                        if cand not in filtered:
+                            filtered = [cand] + filtered
+                        break
             return filtered[:max_urls]
         # If empty after filter, fall back to heuristic sort
         keywords = ["about", "team", "provider", "services", "special", "therapy", "psychological", "location", "contact", "dbt", "emdr", "apex", "raleigh", "durham"]
         ordered = sorted(urls, key=lambda u: (min((u.lower().find(k) if k in u.lower() else 9999) for k in keywords)))
         ordered = [u for u in ordered if not any(x in u.lower() for x in exclude_substrings)]
+        # Ensure at least one location/contact page
+        have_location = any(any(k in u.lower() for k in ["/locations", "/location", "/contact", "/contact-us", "/find-us", "/directions", "/map"]) for u in ordered)
+        if not have_location:
+            for cand in urls:
+                lc = cand.lower()
+                if any(k in lc for k in ["/locations", "/location", "/contact", "/contact-us", "/find-us", "/directions", "/map"]):
+                    if cand not in ordered:
+                        ordered = [cand] + ordered
+                    break
         return ordered[:max_urls]
     except Exception as e:
         app.logger.warning(f"[gemini] selection failed, using heuristic: {e}")
@@ -136,12 +260,13 @@ def gemini_parse_clinic_info(text: str, model_name_env: str = "GEMINI_MODEL_PARS
     api_key = _get_env("GEMINI_API_KEY")
     # Base empty schema
     empty = {
-        "clinic_info": {
+        "clinic_info": _mark_empty_fields_as_error({
+            "clinic_name": "",
             "specialty": "",
             "modalities": "",
             "location": "",
             "clinic_size": "",
-        }
+        })
     }
     if not text or not text.strip():
         return {**empty, "model": None, "reason": "empty_text"}
@@ -159,10 +284,20 @@ def gemini_parse_clinic_info(text: str, model_name_env: str = "GEMINI_MODEL_PARS
             },
         )
 
-        # Cap context to ~20k chars to avoid excessive latency
+        # Cap context by env budgets: GEMINI_TOKEN_BUDGET (tokens) preferred, else CONTEXT_SIZE (chars), else 20k chars
         context = (text or "").strip()
-        if len(context) > 20000:
-            context = context[:20000]
+        try:
+            token_budget = int(os.environ.get("GEMINI_TOKEN_BUDGET") or "0")
+        except Exception:
+            token_budget = 0
+        try:
+            context_chars_env = int(os.environ.get("CONTEXT_SIZE") or "0")
+        except Exception:
+            context_chars_env = 0
+        approx_chars_from_tokens = token_budget * 4 if token_budget > 0 else 0
+        char_cap = approx_chars_from_tokens or context_chars_env or 20000
+        if len(context) > char_cap:
+            context = context[:char_cap]
 
         prompt = {
             "task": "parse_clinic_info",
@@ -205,12 +340,13 @@ def gemini_parse_clinic_info(text: str, model_name_env: str = "GEMINI_MODEL_PARS
             # Normalize to expected schema
             ci = data.get("clinic_info") if isinstance(data, dict) else None
             out = {
-                "clinic_info": {
+                "clinic_info": _mark_empty_fields_as_error({
+                    "clinic_name": (ci or {}).get("clinic_name", "") if isinstance(ci, dict) else "",
                     "specialty": (ci or {}).get("specialty", "") if isinstance(ci, dict) else "",
                     "modalities": (ci or {}).get("modalities", "") if isinstance(ci, dict) else "",
                     "location": (ci or {}).get("location", "") if isinstance(ci, dict) else "",
                     "clinic_size": (ci or {}).get("clinic_size", "") if isinstance(ci, dict) else "",
-                },
+                }),
                 "model": model_name,
                 "elapsed_ms": elapsed_ms,
             }
@@ -263,10 +399,20 @@ def _fallback_parse_clinic_info(text: str) -> Dict[str, Any]:
             specialty_found.append(s)
     specialty_out = ", ".join(specialty_found[:8])
 
-    # Location: naive city, ST detector (e.g., "Raleigh, NC")
+    # Location: improve heuristics
     import re as _re
-    loc_match = _re.search(r"([A-Z][a-zA-Z]+,\s*[A-Z]{2})(?![A-Za-z])", text or "")
-    location_out = loc_match.group(1) if loc_match else ""
+    # 1) Common address patterns like "123 Main St, Raleigh, NC" or "Raleigh, North Carolina"
+    loc_patterns = [
+        r"\b([A-Z][a-zA-Z]+,\s*[A-Z]{2})\b",  # City, ST
+        r"\b([A-Z][a-zA-Z]+,\s*(Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New\s+Hampshire|New\s+Jersey|New\s+Mexico|New\s+York|North\s+Carolina|North\s+Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode\s+Island|South\s+Carolina|South\s+Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West\s+Virginia|Wisconsin|Wyoming))\b",
+        r"\b(\d+\s+[^,\n]+,\s*[A-Z][a-zA-Z]+,\s*[A-Z]{2})\b",  # 123 Street, City, ST
+    ]
+    location_out = ""
+    for pat in loc_patterns:
+        m = _re.search(pat, text or "")
+        if m:
+            location_out = m.group(1)
+            break
 
     # Clinic size: count provider-like terms
     provider_terms = ["therapist", "psychologist", "psychiatrist", "provider", "counselor", "clinician"]
@@ -282,13 +428,20 @@ def _fallback_parse_clinic_info(text: str) -> Dict[str, Any]:
     else:
         size_out = ""
 
+    # Clinic name: simple heuristic from header/footer
+    clinic_name = ""
+    mname = re.search(r"\b(Three\s+Oaks\s+Behavioral\s+Health\s*&\s*Wellness|[A-Z][A-Za-z0-9&'\-\s]{3,60}(?:Clinic|Health|Wellness|Psychology|Behavioral|Counseling|Therapy|Center|Centre))\b", text)
+    if mname:
+        clinic_name = mname.group(1).strip()
+
     out = {
-        "clinic_info": {
+        "clinic_info": _mark_empty_fields_as_error({
+            "clinic_name": clinic_name,
             "specialty": specialty_out,
             "modalities": modalities_out,
             "location": location_out,
             "clinic_size": size_out,
-        },
+        }),
         "model": None,
         "reason": "heuristic_fallback",
     }
@@ -299,104 +452,190 @@ def _fallback_parse_clinic_info(text: str) -> Dict[str, Any]:
 @app.post("/api/discover-select-scrape")
 def discover_select_scrape() -> Any:
     payload = request.get_json(silent=True) or {}
-    # Accept either single 'url'/'base_url' or 'urls' (comma-separated); use first non-empty
-    base_url = (payload.get("url") or payload.get("base_url") or "").strip()
-    if not base_url:
-        urls_value = payload.get("urls") or ""
+    # Accept either single 'url'/'base_url' or 'urls' (comma-separated)
+    base_urls: List[str] = []
+    
+    # Handle single URL
+    single_url = (payload.get("url") or payload.get("base_url") or "").strip()
+    if single_url:
+        base_urls.append(single_url)
+    
+    # Handle multiple URLs
+    urls_value = payload.get("urls") or ""
+    if urls_value:
         urls_list = split_comma_separated_urls(urls_value)
-        if urls_list:
-            base_url = urls_list[0]
-    if not base_url:
-        return jsonify({"error": "base url required", "hint": "Provide 'url' or 'urls' in JSON body."}), 400
+        for url in urls_list:
+            if url not in base_urls:
+                base_urls.append(url)
+    
+    if not base_urls:
+        return jsonify({"error": "base url(s) required", "hint": "Provide 'url', 'base_url', or 'urls' in JSON body."}), 400
+    
     max_discover = int(payload.get("max_discover") or 20)
-    max_select = int(payload.get("max_select") or 10)
-    limit_chars = int(payload.get("limit_chars") or 500)
+    max_select = int(payload.get("max_select") or 5)
+    limit_chars = int(payload.get("limit_chars") or 13000)
 
-    # 1) Discover
-    sitemap_all = discover_from_sitemap(base_url, max_urls=None)
-    if sitemap_all:
-        discovery_mode = "sitemap.xml"
-        all_targets = sitemap_all
-    else:
-        discovery_mode = "heuristic"
-        all_targets = discover_candidate_paths(base_url, max_urls=max_discover)
-    app.logger.info(f"[dsl] discover({discovery_mode}) -> {len(all_targets)} targets")
+    # Process each clinic/base URL separately
+    clinics_data = {}
+    
+    for base_url in base_urls:
+        app.logger.info(f"[dsl] Processing clinic: {base_url}")
+        
+        # 1) Discover
+        sitemap_all = discover_from_sitemap(base_url, max_urls=None)
+        if sitemap_all:
+            discovery_mode = "sitemap.xml"
+            all_targets = sitemap_all
+        else:
+            discovery_mode = "heuristic"
+            all_targets = discover_candidate_paths(base_url, max_urls=max_discover)
+        app.logger.info(f"[dsl] discover({discovery_mode}) -> {len(all_targets)} targets")
 
-    # 2) Select with Gemini (or heuristic)
-    selected = gemini_select_relevant_urls(all_targets, max_urls=max_select)
-    app.logger.info(f"[dsl] selected -> {len(selected)} targets")
+        # 2) Select with Gemini (or heuristic)
+        # Filter out sitemap/robots-like URLs before selection and scraping
+        def _not_index_like(u: str) -> bool:
+            lu = (u or "").lower()
+            return not ("sitemap" in lu or lu.endswith("/robots.txt") or lu.endswith("robots.txt"))
+        filtered_targets = [u for u in all_targets if _not_index_like(u) and not _is_media_url(u)]
+        selected = gemini_select_relevant_urls(filtered_targets, max_urls=max_select)
+        app.logger.info(f"[dsl] selected -> {len(selected)} targets")
 
-    # 3) Scrape selected
-    results: List[Dict[str, Any]] = []
-    for u in selected:
-        start_time = time.time()
-        res = fetch_markdown_jina(u)
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        full_text = res.get("text", "")
-        res["text"] = full_text[:limit_chars]
-        res["snippet"] = res["text"]
-        res["elapsed_ms"] = elapsed_ms
-        try:
-            res_parsed = urlparse(res.get("target", u))
-            res["path"] = res_parsed.path or '/'
-        except Exception:
-            res["path"] = '/'
-        results.append(res)
+        # 3) Scrape selected
+        results: List[Dict[str, Any]] = []
+        for u in selected:
+            start_time = time.time()
+            res = fetch_markdown_jina(u)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            full_text = res.get("text", "")
+            res["text"] = full_text[:limit_chars]
+            res["snippet"] = res["text"]
+            res["elapsed_ms"] = elapsed_ms
+            try:
+                res_parsed = urlparse(res.get("target", u))
+                res["path"] = res_parsed.path or '/'
+            except Exception:
+                res["path"] = '/'
+            results.append(res)
 
-    # 4) Parse combined text with Gemini into structured JSON
-    combined_text = "\n\n".join([r.get("text", "") for r in results if r.get("text")])
-    parsed = gemini_parse_clinic_info(combined_text)
+        # 4) Parse combined text with Gemini into structured JSON
+        # Build combined text, appending a small location snippet (if present) to boost location recall
+        parts: List[str] = []
+        for r in results:
+            t = r.get("text", "") or ""
+            if t:
+                parts.append(t)
+                loc_snippet = _extract_location_snippet(t)
+                if loc_snippet:
+                    parts.append("\n\n" + loc_snippet)
+        combined_text = "\n\n".join(parts)
+        # Prepend explicit location candidates to steer the model
+        candidates: List[str] = []
+        for r in results:
+            t = r.get("text", "") or ""
+            for c in _extract_location_candidates(t):
+                if c not in candidates:
+                    candidates.append(c)
+        if candidates:
+            combined_text = (
+                "Possible location candidates (frequency‑sorted):\n"
+                + "\n".join(f"- {c}" for c in candidates)
+                + "\n\n" + combined_text
+            )
+        parsed = gemini_parse_clinic_info(combined_text)
 
+        # Store clinic data
+        clinics_data[base_url] = {
+            "base_url": base_url,
+            "discovery_mode": discovery_mode,
+            "discovered_count": len(all_targets),
+            "selected_count": len(selected),
+            "discovered": all_targets,
+            "selected": selected,
+            "limit_chars": limit_chars,
+            "results": results,
+            "clinic_info": parsed.get("clinic_info"),
+            "parse_elapsed_ms": parsed.get("elapsed_ms"),
+            "parse_model": parsed.get("model"),
+        }
+
+    # Return combined structure
     return jsonify({
-        "base_url": base_url,
-        "discovery_mode": discovery_mode,
-        "discovered_count": len(all_targets),
-        "selected_count": len(selected),
-        "discovered": all_targets,
-        "selected": selected,
-        "limit_chars": limit_chars,
-        "results": results,
-        "clinic_info": parsed.get("clinic_info"),
-        "parse_elapsed_ms": parsed.get("elapsed_ms"),
-        "parse_model": parsed.get("model"),
+        "total_clinics": len(base_urls),
+        "processed_urls": base_urls,
+        "clinics": clinics_data,
+        # Summary for backwards compatibility
+        "summary": {
+            "total_discovered": sum(clinic["discovered_count"] for clinic in clinics_data.values()),
+            "total_selected": sum(clinic["selected_count"] for clinic in clinics_data.values()),
+        }
     })
 
 
 @app.post("/api/discover-select")
 def discover_and_select_only() -> Any:
     payload = request.get_json(silent=True) or {}
-    base_url = (payload.get("url") or payload.get("base_url") or "").strip()
-    if not base_url:
-        urls_value = payload.get("urls") or ""
+    # Accept either single 'url'/'base_url' or 'urls' (comma-separated)
+    base_urls: List[str] = []
+    
+    # Handle single URL
+    single_url = (payload.get("url") or payload.get("base_url") or "").strip()
+    if single_url:
+        base_urls.append(single_url)
+    
+    # Handle multiple URLs
+    urls_value = payload.get("urls") or ""
+    if urls_value:
         urls_list = split_comma_separated_urls(urls_value)
-        if urls_list:
-            base_url = urls_list[0]
-    if not base_url:
-        return jsonify({"error": "base url required", "hint": "Provide 'url' or 'urls' in JSON body."}), 400
+        for url in urls_list:
+            if url not in base_urls:
+                base_urls.append(url)
+    
+    if not base_urls:
+        return jsonify({"error": "base url(s) required", "hint": "Provide 'url', 'base_url', or 'urls' in JSON body."}), 400
+    
     max_discover = int(payload.get("max_discover") or 100)
-    max_select = int(payload.get("max_select") or 10)
+    max_select = int(payload.get("max_select") or 5)
 
-    # Discover
-    sitemap_all = discover_from_sitemap(base_url, max_urls=None)
-    if sitemap_all:
-        discovery_mode = "sitemap.xml"
-        all_targets = sitemap_all
-    else:
-        discovery_mode = "heuristic"
-        all_targets = discover_candidate_paths(base_url, max_urls=max_discover)
-    app.logger.info(f"[dsl] discover-only({discovery_mode}) -> {len(all_targets)} targets")
+    # Process each clinic/base URL separately
+    clinics_data = {}
+    
+    for base_url in base_urls:
+        app.logger.info(f"[discover-select] Processing clinic: {base_url}")
+        
+        # Discover
+        sitemap_all = discover_from_sitemap(base_url, max_urls=None)
+        if sitemap_all:
+            discovery_mode = "sitemap.xml"
+            all_targets = sitemap_all
+        else:
+            discovery_mode = "heuristic"
+            all_targets = discover_candidate_paths(base_url, max_urls=max_discover)
+        app.logger.info(f"[dsl] discover-only({discovery_mode}) -> {len(all_targets)} targets")
 
-    # Select
-    selected = gemini_select_relevant_urls(all_targets, max_urls=max_select)
-    app.logger.info(f"[dsl] selected-only -> {len(selected)} targets")
+        # Select
+        selected = gemini_select_relevant_urls(all_targets, max_urls=max_select)
+        app.logger.info(f"[dsl] selected-only -> {len(selected)} targets")
 
+        # Store clinic data
+        clinics_data[base_url] = {
+            "base_url": base_url,
+            "discovery_mode": discovery_mode,
+            "discovered_count": len(all_targets),
+            "selected_count": len(selected),
+            "discovered": all_targets,
+            "selected": selected,
+        }
+
+    # Return combined structure
     return jsonify({
-        "base_url": base_url,
-        "discovery_mode": discovery_mode,
-        "discovered_count": len(all_targets),
-        "selected_count": len(selected),
-        "discovered": all_targets,
-        "selected": selected,
+        "total_clinics": len(base_urls),
+        "processed_urls": base_urls,
+        "clinics": clinics_data,
+        # Summary for backwards compatibility
+        "summary": {
+            "total_discovered": sum(clinic["discovered_count"] for clinic in clinics_data.values()),
+            "total_selected": sum(clinic["selected_count"] for clinic in clinics_data.values()),
+        }
     })
 
 
@@ -410,12 +649,15 @@ def scrape_specific_pages() -> Any:
         urls = split_comma_separated_urls(urls_value)
     if not urls:
         return jsonify({"error": "urls required", "hint": "Provide 'urls' as array or comma-separated."}), 400
-    limit_chars = int(payload.get("limit_chars") or 500)
+    limit_chars = int(payload.get("limit_chars") or 13000)
 
     results: List[Dict[str, Any]] = []
     for u in urls:
         start_time = time.time()
         app.logger.info(f"[fetch:pages] -> {u}")
+        if _is_media_url(u) or "sitemap" in (u or "").lower() or (u or "").lower().endswith("robots.txt"):
+            # Skip media and index-like URLs
+            continue
         res = fetch_markdown_jina(u)
         elapsed_ms = int((time.time() - start_time) * 1000)
         full_text = res.get("text", "")
@@ -452,8 +694,21 @@ def parse_endpoint() -> Any:
         for u in urls[:5]:
             res = fetch_markdown_jina(u)
             if res.get("ok") and res.get("text"):
-                parts.append(res.get("text", "")[:800])
+                t = res.get("text", "")[:13000]
+                parts.append(t)
+                loc_snippet = _extract_location_snippet(t)
+                if loc_snippet:
+                    parts.append("\n\n" + loc_snippet)
         text = "\n\n".join(parts)
+    # When building context from URLs, also prepend location candidates
+    if text:
+        cands = _extract_location_candidates(text)
+        if cands:
+            text = (
+                "Possible location candidates (frequency‑sorted):\n"
+                + "\n".join(f"- {c}" for c in cands)
+                + "\n\n" + text
+            )
     parsed = gemini_parse_clinic_info(text)
     return jsonify(parsed)
 
@@ -478,7 +733,7 @@ def normalize_url_for_jina(url: str) -> str:
     return f"https://{url}"
 
 
-def fetch_markdown_jina(url: str, timeout_seconds: int = 45, retries: int = 1, retry_delay_seconds: float = 1.0) -> Dict[str, Any]:
+def fetch_markdown_jina(url: str, timeout_seconds: int = 45, retries: int = 2, retry_delay_seconds: float = 1.0) -> Dict[str, Any]:
     target = normalize_url_for_jina(url)
     reader_url = f"https://r.jina.ai/{target}"
     attempt = 0
@@ -493,6 +748,16 @@ def fetch_markdown_jina(url: str, timeout_seconds: int = 45, retries: int = 1, r
                     "Accept": "text/markdown, text/plain, */*",
                 },
             )
+            # Handle rate limiting (HTTP 429): respect Retry-After if present
+            if resp.status_code == 429:
+                try:
+                    retry_after = float(resp.headers.get("Retry-After", retry_delay_seconds))
+                except Exception:
+                    retry_after = retry_delay_seconds
+                if attempt < retries:
+                    time.sleep(max(retry_after, retry_delay_seconds))
+                    attempt += 1
+                    continue
             ok = resp.status_code == 200 and bool(resp.text.strip())
             text = resp.text if ok else ""
             return {
@@ -555,20 +820,25 @@ def _extract_urls_from_text(text: str) -> List[str]:
     # Match <loc>http(s)://... </loc>
     for m in re.findall(r"<loc>\s*(https?://[^<\s]+)\s*</loc>", text, flags=re.IGNORECASE):
         urls.append(m.strip())
-    # Match raw http(s) links as fallback
-    for m in re.findall(r"https?://[^\s\"'<>]+", text):
-        urls.append(m.strip())
+    # Match raw http(s) links as fallback, excluding markdown and common terminators
+    for m in re.findall(r"https?://[^\s\"'<>\)\]\}]+", text):
+        # Additional cleanup for URLs that might have trailing punctuation
+        clean_url = re.sub(r'[,;.!?]+$', '', m.strip())
+        urls.append(clean_url)
     # de-duplicate while preserving order
     seen = set()
     ordered = []
     for u in urls:
-        if u not in seen:
-            seen.add(u)
-            ordered.append(u)
+        # Final cleanup: remove any remaining markdown artifacts
+        cleaned_url = re.sub(r'\)\]\([^)]*\)$', '', u)
+        cleaned_url = re.sub(r'\)$', '', cleaned_url)
+        if cleaned_url and cleaned_url not in seen:
+            seen.add(cleaned_url)
+            ordered.append(cleaned_url)
     return ordered
 
 
-def discover_from_sitemap(base_url: str, max_urls: Optional[int] = 8) -> List[str]:
+def discover_from_sitemap(base_url: str, max_urls: Optional[int] = 20) -> List[str]:
     base = normalize_url_for_jina(base_url)
     parsed = urlparse(base)
     if not parsed.scheme or not parsed.netloc:
@@ -578,10 +848,14 @@ def discover_from_sitemap(base_url: str, max_urls: Optional[int] = 8) -> List[st
     primary = urljoin(domain + '/', 'sitemap.xml')
     res_primary = fetch_markdown_jina(primary)
     discovered: List[str] = []
-    if res_primary.get("ok") and res_primary.get("text"):
+    if res_primary.get("ok") and res_primary.get("text") and res_primary.get("text", "").strip():
         urls_in_text = _extract_urls_from_text(res_primary.get("text", ""))
+        # Skip if sitemap.xml has no actual URLs (empty content issue)
+        if not urls_in_text:
+            app.logger.info(f"[sitemap] base={base} sitemap.xml exists but contains no URLs")
+            return []
         for u in urls_in_text:
-            if _same_domain(u, base) and u not in discovered:
+            if _same_domain(u, base) and u not in discovered and not _is_media_url(u):
                 discovered.append(u)
                 if max_urls and len(discovered) >= max_urls:
                     app.logger.info(f"[sitemap] base={base} found={len(discovered)} (sitemap.xml)")
@@ -590,14 +864,16 @@ def discover_from_sitemap(base_url: str, max_urls: Optional[int] = 8) -> List[st
     # Next try sitemap_index.xml (may contain nested sitemaps)
     secondary = urljoin(domain + '/', 'sitemap_index.xml')
     res_index = fetch_markdown_jina(secondary)
-    if res_index.get("ok") and res_index.get("text"):
+    if res_index.get("ok") and res_index.get("text") and res_index.get("text", "").strip():
         urls_in_text = _extract_urls_from_text(res_index.get("text", ""))
-        for u in urls_in_text:
-            if _same_domain(u, base) and u not in discovered:
-                discovered.append(u)
-                if max_urls and len(discovered) >= max_urls:
-                    app.logger.info(f"[sitemap] base={base} found={len(discovered)} (sitemap_index.xml)")
-                    return discovered[:max_urls]
+        # Skip if sitemap_index.xml has no actual URLs
+        if urls_in_text:
+            for u in urls_in_text:
+                if _same_domain(u, base) and u not in discovered and not _is_media_url(u):
+                    discovered.append(u)
+                    if max_urls and len(discovered) >= max_urls:
+                        app.logger.info(f"[sitemap] base={base} found={len(discovered)} (sitemap_index.xml)")
+                        return discovered[:max_urls]
 
     # Finally, check robots.txt for additional sitemap hints
     robots = fetch_markdown_jina(urljoin(domain + '/', 'robots.txt'))
@@ -612,7 +888,7 @@ def discover_from_sitemap(base_url: str, max_urls: Optional[int] = 8) -> List[st
                 continue
             urls_in_text = _extract_urls_from_text(res.get("text", ""))
             for u in urls_in_text:
-                if _same_domain(u, base) and u not in discovered:
+                if _same_domain(u, base) and u not in discovered and not _is_media_url(u):
                     discovered.append(u)
                     if max_urls and len(discovered) >= max_urls:
                         app.logger.info(f"[sitemap] base={base} found={len(discovered)} (robots sitemaps)")
@@ -621,7 +897,7 @@ def discover_from_sitemap(base_url: str, max_urls: Optional[int] = 8) -> List[st
     return discovered if not max_urls else discovered[:max_urls]
 
 
-def discover_candidate_paths_with_mode(base_url: str, max_urls: int = 8) -> Dict[str, Any]:
+def discover_candidate_paths_with_mode(base_url: str, max_urls: int = 20) -> Dict[str, Any]:
     base = normalize_url_for_jina(base_url)
     parsed = urlparse(base)
     if not parsed.scheme or not parsed.netloc:
@@ -632,7 +908,7 @@ def discover_candidate_paths_with_mode(base_url: str, max_urls: int = 8) -> Dict
     sitemap_urls = discover_from_sitemap(base, max_urls=None)
     discovery_mode = "sitemap.xml" if sitemap_urls else "heuristic"
     # Core heuristic paths as fallback
-    common_paths = ['', 'about', 'team', 'services']
+    common_paths = ['', 'about', 'team', 'services', 'providers', 'locations', 'contact']
     candidates: List[str] = []
     seen: set[str] = set()
     # Add sitemap URLs first
@@ -655,7 +931,7 @@ def discover_candidate_paths_with_mode(base_url: str, max_urls: int = 8) -> Dict
     return {"candidates": candidates[:max_urls], "discovery_mode": discovery_mode}
 
 
-def discover_candidate_paths(base_url: str, max_urls: int = 8) -> List[str]:
+def discover_candidate_paths(base_url: str, max_urls: int = 20) -> List[str]:
     return discover_candidate_paths_with_mode(base_url, max_urls=max_urls)["candidates"]
 
 
@@ -669,7 +945,7 @@ def scrape_with_jina() -> Any:
 
     results: List[Dict[str, Any]] = []
     expanded_targets: List[Dict[str, str]] = []
-    max_urls = int(payload.get("max_urls") or 8)
+    max_urls = int(payload.get("max_urls") or 20)
     for base in urls:
         for candidate in discover_candidate_paths(base, max_urls=max_urls):
             expanded_targets.append({"base_url": base, "url": candidate})

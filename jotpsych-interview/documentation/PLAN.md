@@ -25,7 +25,7 @@ JotPsych Case Study – Action Plan (Starter-Aligned)
       - `parser_gemini.py`: Gemini JSON extraction
       - `text_utils.py`: normalization, dedupe, truncation
   - Docs: `documentation/`
-    - `PLAN.md`, `PROMPT.md`
+    - `PLAN.md`, `TUNNING_GUIDE.md`
   - Config: `.env.local` (e.g., `GEMINI_API_KEY`), `requirements.txt`, `next.config.js`, `package.json`
 
 ### High-Level Architecture
